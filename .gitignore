@@ -23,5 +23,8 @@ datasets/
 .idea/
 
 # OS
+.env
+replace.txt
 Thumbs.db
-.DS_Store
+.DS_Store.env
+replace.txt
