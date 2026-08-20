@@ -1,102 +1,30 @@
-import cv2
 import csv
-import os
-from datetime import datetime
-from collections import defaultdict, Counter
-import time
-import requests
 import json
+import os
+import queue
+import threading
+import time
+from collections import Counter
+from datetime import datetime
 
+import cv2
+import requests
+from dotenv import load_dotenv
 from ultralytics import YOLO
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+load_dotenv()
 
-MODEL_PATH = r"runs\detect\train-3\weights\best.pt"
 
+MODEL_PATH = r"runs\detect\train-6\weights\best.pt"
 OUTPUT_CSV = "observations.csv"
 
 CAMERA_INDEX = 0
 
-IMAGE_SIZE = 640
-CONFIDENCE = 0.70
+IMAGE_SIZE = 1280
+CONFIDENCE = 0.40
 
-# ============================================================
-# TELEGRAM TEST CONFIGURATION
-# ============================================================
-# Isi dengan token dari @BotFather.
-# JANGAN upload token ini ke GitHub.
-TELEGRAM_BOT_TOKEN = "Redacted"
-
-# Bisa berupa @username_channel atau chat ID angka.
-TELEGRAM_CHAT_ID = -1004460895066
-
-# Username Telegram anggota yang ingin di-ping.
-# Contoh: ["@anggota1", "@anggota2"]
-# Catatan: Telegram tidak punya @everyone universal seperti Discord.
-TELEGRAM_MENTIONS = [
-    "@anggota1",
-    "@anggota2",
-]
-
-# Saat testing: kirim setiap 10 detik.
-# Minimal interval antar notifikasi violation.
-# Mencegah spam jika violation terdeteksi terus-menerus.
-TELEGRAM_INTERVAL = 20
-
-# Violation harus terdeteksi pada track person minimal 3 detik.
-VIOLATION_MIN_DURATION = 3.0
-
-# Track ID yang sudah pernah dilaporkan.
-# Dipakai agar violation yang sama tidak terus dikirim.
-reported_violation_ids = set()
-
-# track_id -> waktu pertama kali violation terdeteksi
-violation_start_times = {}
-
-# track_id -> APD yang sedang hilang
-active_violation_ppe = {}
-
-
-# Nama file sementara untuk capture.
-TELEGRAM_RAW_IMAGE = "telegram_capture_raw.jpg"
-TELEGRAM_BOX_IMAGE = "telegram_capture_box.jpg"
-
-# Tracker
 TRACKER_CONFIG = "botsort.yaml"
-
-# Minimal jumlah frame sebuah person harus terlihat
-# sebelum dianggap sebagai observation
-MIN_FRAMES = 10
-
-# Berapa frame terakhir digunakan untuk majority voting
-MAX_HISTORY = 100
-
-# Setelah ID tidak terlihat selama beberapa frame,
-# observation dianggap selesai.
-MAX_MISSING_FRAMES = 30
-
-
-# ============================================================
-# CLASS NAME CONFIGURATION
-# ============================================================
-#
-# Sesuaikan dengan model kamu.
-#
-# Contoh:
-#
-# person
-# helmet
-# vest
-# mask
-# gloves
-# shoes
-#
-# Jika model kamu menggunakan nama berbeda,
-# ubah dictionary ini.
-# ============================================================
 
 PERSON_CLASS = "person"
 
@@ -105,844 +33,637 @@ PPE_CLASSES = [
     "vest",
 ]
 
+MIN_FRAMES = 10
+MAX_HISTORY = 100
+MAX_MISSING_FRAMES = 60
 
-# ============================================================
-# LOAD MODEL
-# ============================================================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-print("Loading model...")
-
-model = YOLO(MODEL_PATH)
-
-print("\nModel classes:")
-print(model.names)
-
-print("\n")
-
-
-# ============================================================
-# CHECK PERSON CLASS
-# ============================================================
-
-model_class_names = [
-    str(name).lower()
-    for name in model.names.values()
+TELEGRAM_MENTIONS = [
+    "@anggota1",
+    "@anggota2",
 ]
 
-if PERSON_CLASS.lower() not in model_class_names:
+TELEGRAM_INTERVAL = 20
+VIOLATION_MIN_DURATION = 3.0
 
-    print("ERROR:")
-    print("Class 'person' tidak ditemukan di model.")
-    print()
-    print("Class yang tersedia:")
-    print(model.names)
-    print()
-    print(
-        "Model kamu harus mendeteksi 'person' "
-        "agar tracking orang dapat dilakukan."
-    )
-
-    exit()
+JPEG_QUALITY = 85
+TELEGRAM_QUEUE_SIZE = 10
 
 
-# ============================================================
-# CAMERA
-# ============================================================
-
-cap = cv2.VideoCapture(
-    CAMERA_INDEX,
-    cv2.CAP_DSHOW
-)
-
-if not cap.isOpened():
-
-    print("Kamera gagal dibuka.")
-
-    exit()
-
-
-# ============================================================
-# CSV FILE
-# ============================================================
-
-file_exists = os.path.exists(OUTPUT_CSV)
-
-csv_file = open(
-    OUTPUT_CSV,
-    mode="a",
-    newline="",
-    encoding="utf-8"
-)
-
-csv_writer = csv.writer(csv_file)
-
-
-# Header CSV
-if not file_exists:
-
-    header = [
-        "observation_id",
-        "timestamp",
-        "track_id",
-        "frames_observed"
-    ]
-
-    # Tambahkan class APD
-    for ppe in PPE_CLASSES:
-        header.append(ppe)
-
-    header.append("violation")
-
-    csv_writer.writerow(header)
-
-
-# ============================================================
-# TRACK DATA
-# ============================================================
-
+reported_violation_ids = set()
+violation_start_times = {}
+active_violation_ppe = {}
 tracks = {}
 
+telegram_queue = queue.Queue(
+    maxsize=TELEGRAM_QUEUE_SIZE
+)
 
-# Struktur:
-#
-# tracks[track_id] = {
-#
-#     "first_seen": timestamp,
-#     "last_seen_frame": frame_number,
-#     "frames": 0,
-#
-#     "ppe_history": {
-#         "helmet": [],
-#         "vest": [],
-#         ...
-#     }
-# }
-
-
-observation_id = 1
-
-
-# Cari observation ID terakhir dari CSV
-if file_exists:
-
-    try:
-
-        with open(
-            OUTPUT_CSV,
-            mode="r",
-            encoding="utf-8"
-        ) as f:
-
-            reader = csv.DictReader(f)
-
-            rows = list(reader)
-
-            if len(rows) > 0:
-
-                observation_id = (
-                    int(rows[-1]["observation_id"]) + 1
-                )
-
-    except Exception:
-
-        observation_id = 1
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
 
 def center_of_box(box):
-    """
-    Mengambil titik tengah bounding box.
-    """
-
     x1, y1, x2, y2 = box
 
-    cx = (x1 + x2) / 2
-    cy = (y1 + y2) / 2
-
-    return cx, cy
+    return (
+        (x1 + x2) / 2,
+        (y1 + y2) / 2,
+    )
 
 
 def point_inside_box(point, box):
-    """
-    Mengecek apakah sebuah titik berada
-    di dalam bounding box.
-    """
-
     px, py = point
-
     x1, y1, x2, y2 = box
 
     return (
         x1 <= px <= x2
-        and
-        y1 <= py <= y2
+        and y1 <= py <= y2
     )
 
 
-def associate_ppe_to_person(
-    person_box,
-    ppe_detections
+def box_area(box):
+    x1, y1, x2, y2 = box
+
+    return (
+        max(0, x2 - x1)
+        * max(0, y2 - y1)
+    )
+
+
+def associate_ppe_to_persons(
+    persons,
+    ppe_detections,
 ):
-    """
-    Menghubungkan objek APD dengan person
-    berdasarkan posisi bounding box.
-
-    Jika center bounding box APD berada
-    di dalam bounding box person,
-    APD dianggap milik person tersebut.
-    """
-
-    detected_ppe = set()
+    assignments = {
+        person["track_id"]: set()
+        for person in persons
+    }
 
     for ppe in ppe_detections:
-
-        ppe_class = ppe["class"]
-
-        ppe_box = ppe["box"]
-
         ppe_center = center_of_box(
-            ppe_box
+            ppe["box"]
         )
 
-        if point_inside_box(
-            ppe_center,
-            person_box
-        ):
+        candidates = []
 
-            detected_ppe.add(
-                ppe_class
-            )
+        for person in persons:
+            if point_inside_box(
+                ppe_center,
+                person["box"],
+            ):
+                candidates.append(person)
 
-    return detected_ppe
+        if not candidates:
+            continue
+
+        best_person = min(
+            candidates,
+            key=lambda person: box_area(
+                person["box"]
+            ),
+        )
+
+        assignments[
+            best_person["track_id"]
+        ].add(
+            ppe["class"]
+        )
+
+    return assignments
 
 
 def majority_vote(values):
-
-    if len(values) == 0:
-
+    if not values:
         return 0
 
-    counter = Counter(values)
-
-    return counter.most_common(1)[0][0]
-
-
-def finalize_observation(
-    track_id,
-    track_data
-):
-
-    global observation_id
-
-    frames = track_data["frames"]
-
-    # Jangan simpan track yang terlalu singkat
-    if frames < MIN_FRAMES:
-
-        print(
-            f"[SKIP] Track {track_id} "
-            f"hanya {frames} frame."
-        )
-
-        return
-
-    # ========================================================
-    # MAJORITY VOTING
-    # ========================================================
-
-    final_ppe = {}
-
-    for ppe in PPE_CLASSES:
-
-        history = (
-            track_data["ppe_history"][ppe]
-        )
-
-        final_ppe[ppe] = majority_vote(
-            history
-        )
-
-    # ========================================================
-    # VIOLATION
-    # ========================================================
-
-    # Jika salah satu APD tidak terdeteksi
-    violation = 0
-
-    for ppe in PPE_CLASSES:
-
-        if final_ppe[ppe] == 0:
-
-            violation = 1
-
-            break
-
-    # ========================================================
-    # TIMESTAMP
-    # ========================================================
-
-    timestamp = track_data["first_seen"]
-
-    # ========================================================
-    # SAVE CSV
-    # ========================================================
-
-    row = [
-        observation_id,
-        timestamp,
-        track_id,
-        frames
-    ]
-
-    for ppe in PPE_CLASSES:
-
-        row.append(
-            final_ppe[ppe]
-        )
-
-    row.append(violation)
-
-    csv_writer.writerow(row)
-
-    csv_file.flush()
-
-    # ========================================================
-    # PRINT RESULT
-    # ========================================================
-
-    status = (
-        "VIOLATION"
-        if violation == 1
-        else "COMPLIANT"
-    )
-
-    print()
-    print("=" * 60)
-
-    print(
-        f"OBSERVATION #{observation_id}"
-    )
-
-    print(
-        f"Track ID      : {track_id}"
-    )
-
-    print(
-        f"Frames        : {frames}"
-    )
-
-    print(
-        f"Status        : {status}"
-    )
-
-    print(
-        "APD           :"
-    )
-
-    for ppe in PPE_CLASSES:
-
-        status_ppe = (
-            "DETECTED"
-            if final_ppe[ppe] == 1
-            else "NOT DETECTED"
-        )
-
-        print(
-            f"  {ppe:<10}: {status_ppe}"
-        )
-
-    print("=" * 60)
-
-    observation_id += 1
-
-
-# ============================================================
-# TELEGRAM FUNCTIONS
-# ============================================================
-
-def telegram_send_message(text):
-    """Mengirim pesan teks ke Telegram."""
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ISI_TOKEN_BOT_DI_SINI":
-        print("[TELEGRAM] Token belum diisi.")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-    try:
-        response = requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-            },
-            timeout=15
-        )
-
-        if response.ok:
-            print("[TELEGRAM] Pesan berhasil dikirim.")
-            return True
-
-        print(
-            f"[TELEGRAM] Gagal mengirim pesan: "
-            f"{response.status_code} {response.text}"
-        )
-
-    except requests.RequestException as e:
-        print(f"[TELEGRAM] Error koneksi: {e}")
-
-    return False
-
-
-def telegram_send_photo(image_path, caption=""):
-    """Mengirim foto ke Telegram."""
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ISI_TOKEN_BOT_DI_SINI":
-        print("[TELEGRAM] Token belum diisi.")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-
-    try:
-        with open(image_path, "rb") as photo:
-            response = requests.post(
-                url,
-                data={
-                    "chat_id": str(TELEGRAM_CHAT_ID),
-                    "caption": caption,
-                },
-                files={
-                    "photo": (
-                        os.path.basename(image_path),
-                        photo,
-                        "image/jpeg",
-                    ),
-                },
-                timeout=30
-            )
-
-        result = response.json()
-
-        if result.get("ok"):
-            print(f"[TELEGRAM] Foto berhasil dikirim: {image_path}")
-            return True
-
-        print(
-            f"[TELEGRAM] Gagal mengirim foto: "
-            f"{response.status_code} {result}"
-        )
-
-
-    except (requests.RequestException, OSError) as e:
-        print(f"[TELEGRAM] Error mengirim foto: {e}")
-
-    return False
+    return Counter(
+        values
+    ).most_common(1)[0][0]
 
 
 def send_violation_to_telegram(
     raw_frame,
     annotated_frame,
     track_id,
-    violation_ppe
+    missing_ppe,
 ):
-    """
-    Mengirim satu notifikasi violation ke Telegram.
-
-    Isi notifikasi:
-    1. Pesan violation.
-    2. Dua gambar dikirim sebagai satu media group/bubble:
-       - foto CCTV tanpa bounding box
-       - foto YOLO dengan bounding box
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    raw_ok = cv2.imwrite(
-        TELEGRAM_RAW_IMAGE,
-        raw_frame
+    raw_success, raw_buffer = cv2.imencode(
+        ".jpg",
+        raw_frame,
+        [
+            cv2.IMWRITE_JPEG_QUALITY,
+            JPEG_QUALITY,
+        ],
     )
 
-    box_ok = cv2.imwrite(
-        TELEGRAM_BOX_IMAGE,
-        annotated_frame
+    annotated_success, annotated_buffer = (
+        cv2.imencode(
+            ".jpg",
+            annotated_frame,
+            [
+                cv2.IMWRITE_JPEG_QUALITY,
+                JPEG_QUALITY,
+            ],
+        )
     )
 
-    if not raw_ok or not box_ok:
-        print("[TELEGRAM] Gagal membuat capture violation.")
+    if (
+        not raw_success
+        or not annotated_success
+    ):
+        print(
+            "[TELEGRAM] Failed to encode images."
+        )
         return False
 
-    # Nama APD yang tidak terdeteksi.
-    if violation_ppe:
-        ppe_text = ", ".join(violation_ppe)
-    else:
-        ppe_text = "APD tidak lengkap"
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
-    mentions = " ".join(TELEGRAM_MENTIONS)
+    violation_text = (
+        ", ".join(missing_ppe)
+        if missing_ppe
+        else "APD tidak lengkap"
+    )
 
-    message = (
+    mentions = " ".join(
+        TELEGRAM_MENTIONS
+    )
+
+    caption = (
         "🚨 VIOLATION TERDETEKSI\n\n"
         f"👤 Person ID: {track_id}\n"
-        f"❌ Pelanggaran: {ppe_text}\n"
+        f"❌ Pelanggaran: {violation_text}\n"
         f"🕐 Waktu: {timestamp}\n\n"
         f"{mentions}"
     )
 
-    # Kirim pesan violation terlebih dahulu.
-    print("[TELEGRAM] Mengirim pesan VIOLATION...")
-    message_ok = telegram_send_message(message)
+    media = [
+        {
+            "type": "photo",
+            "media": "attach://raw_photo",
+            "caption": caption,
+        },
+        {
+            "type": "photo",
+            "media": "attach://annotated_photo",
+        },
+    ]
 
-    if not message_ok:
-        print("[TELEGRAM] Pesan violation gagal dikirim.")
-        return False
-
-    # ========================================================
-    # KIRIM 2 FOTO DALAM SATU MEDIA GROUP / BUBBLE
-    # ========================================================
     url = (
         f"https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
     )
 
+    files = {
+        "raw_photo": (
+            "capture.jpg",
+            raw_buffer.tobytes(),
+            "image/jpeg",
+        ),
+        "annotated_photo": (
+            "detection.jpg",
+            annotated_buffer.tobytes(),
+            "image/jpeg",
+        ),
+    }
+
     try:
-        with open(TELEGRAM_RAW_IMAGE, "rb") as raw_photo, \
-             open(TELEGRAM_BOX_IMAGE, "rb") as box_photo:
-
-            files = {
-                "photo1": (
-                    os.path.basename(TELEGRAM_RAW_IMAGE),
-                    raw_photo,
-                    "image/jpeg"
+        response = requests.post(
+            url,
+            data={
+                "chat_id": str(
+                    TELEGRAM_CHAT_ID
                 ),
-                "photo2": (
-                    os.path.basename(TELEGRAM_BOX_IMAGE),
-                    box_photo,
-                    "image/jpeg"
-                ),
-            }
+                "media": json.dumps(media),
+            },
+            files=files,
+            timeout=30,
+        )
 
-            # Telegram media group memakai attach://filename
-            # sehingga kedua foto dikirim sebagai satu album/bubble.
-            media = [
-                {
-                    "type": "photo",
-                    "media": "attach://photo1",
-                    "caption": "📷 Capture CCTV — tanpa bounding box"
-                },
-                {
-                    "type": "photo",
-                    "media": "attach://photo2",
-                    "caption": "🤖 Capture YOLO — dengan bounding box"
-                }
-            ]
-
-            response = requests.post(
-                url,
-                data={
-                    "chat_id": str(TELEGRAM_CHAT_ID),
-                    "media": json.dumps(media)
-                },
-                files=files,
-                timeout=30
-            )
-
-        result = response.json()
-
-        if result.get("ok"):
+        if response.ok:
             print(
-                "[TELEGRAM] 2 foto violation berhasil "
-                "dikirim sebagai satu media group."
+                f"[TELEGRAM] Sent "
+                f"Track={track_id}"
             )
             return True
 
         print(
-            f"[TELEGRAM] Gagal mengirim media group: "
-            f"{response.status_code} {result}"
+            f"[TELEGRAM] Failed: "
+            f"{response.status_code} "
+            f"{response.text}"
         )
 
-    except (requests.RequestException, OSError, ValueError) as e:
+    except requests.RequestException as error:
         print(
-            f"[TELEGRAM] Error media group: {e}"
+            f"[TELEGRAM] Network error: "
+            f"{error}"
         )
 
     return False
 
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
+def telegram_worker():
+    while True:
+        item = telegram_queue.get()
 
-frame_number = 0
+        if item is None:
+            telegram_queue.task_done()
+            break
 
-# Timer Telegram
-last_telegram_send = time.monotonic() - TELEGRAM_INTERVAL
+        (
+            raw_frame,
+            annotated_frame,
+            track_id,
+            missing_ppe,
+        ) = item
 
-print()
-print("========================================")
-print("YOLO APD PERSON TRACKING")
-print("========================================")
-print(f"Telegram Chat ID : {TELEGRAM_CHAT_ID}")
-print(f"Telegram Interval: {TELEGRAM_INTERVAL} detik")
-print("Telegram violation notification: AKTIF")
-print("Minimal durasi violation: 3 detik.")
-print("Foto RAW + foto YOLO dikirim sebagai satu bubble.")
-print("Press Q to exit")
-print()
+        try:
+            send_violation_to_telegram(
+                raw_frame,
+                annotated_frame,
+                track_id,
+                missing_ppe,
+            )
+
+        except Exception as error:
+            print(
+                f"[TELEGRAM] Worker error: "
+                f"{error}"
+            )
+
+        finally:
+            telegram_queue.task_done()
 
 
-while True:
+def finalize_observation(
+    track_id,
+    track_data,
+    csv_writer,
+    csv_file,
+    observation_id,
+):
+    frames = track_data["frames"]
 
-    ret, frame = cap.read()
+    if frames < MIN_FRAMES:
+        return observation_id
 
-    if not ret:
-
-        print(
-            "Gagal membaca frame."
+    final_ppe = {
+        ppe: majority_vote(
+            track_data["ppe_history"][ppe]
         )
+        for ppe in PPE_CLASSES
+    }
 
-        break
+    violation = int(
+        any(
+            final_ppe[ppe] == 0
+            for ppe in PPE_CLASSES
+        )
+    )
 
-    frame_number += 1
+    row = [
+        observation_id,
+        track_data["first_seen"],
+        track_id,
+        frames,
+    ]
+
+    row.extend(
+        final_ppe[ppe]
+        for ppe in PPE_CLASSES
+    )
+
+    row.append(violation)
+
+    csv_writer.writerow(row)
+    csv_file.flush()
+
+    status = (
+        "VIOLATION"
+        if violation
+        else "COMPLIANT"
+    )
+
+    print(
+        f"[OBSERVATION] "
+        f"ID={observation_id} "
+        f"Track={track_id} "
+        f"Frames={frames} "
+        f"Status={status}"
+    )
+
+    return observation_id + 1
 
 
-    # ========================================================
-    # YOLO TRACKING
-    # ========================================================
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError(
+        "TELEGRAM_BOT_TOKEN tidak ditemukan "
+        "di file .env"
+    )
 
-    results = model.track(
+if not TELEGRAM_CHAT_ID:
+    raise RuntimeError(
+        "TELEGRAM_CHAT_ID tidak ditemukan "
+        "di file .env"
+    )
 
-        source=frame,
-
-        imgsz=IMAGE_SIZE,
-
-        device=0,
-
-        conf=CONFIDENCE,
-
-        persist=True,
-
-        tracker=TRACKER_CONFIG,
-
-        verbose=False
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"Model tidak ditemukan: "
+        f"{MODEL_PATH}"
     )
 
 
-    result = results[0]
+model = YOLO(MODEL_PATH)
+
+model_class_names = {
+    str(name).lower()
+    for name in model.names.values()
+}
+
+if PERSON_CLASS not in model_class_names:
+    raise ValueError(
+        f"Class '{PERSON_CLASS}' "
+        "tidak ditemukan pada model."
+    )
+
+missing_classes = [
+    ppe
+    for ppe in PPE_CLASSES
+    if ppe not in model_class_names
+]
+
+if missing_classes:
+    raise ValueError(
+        f"PPE class tidak ditemukan: "
+        f"{missing_classes}"
+    )
 
 
-    # ========================================================
-    # CURRENT TRACK IDs
-    # ========================================================
+cap = cv2.VideoCapture(
+    CAMERA_INDEX,
+    cv2.CAP_DSHOW,
+)
 
-    current_track_ids = set()
+if not cap.isOpened():
+    raise RuntimeError(
+        "Kamera gagal dibuka."
+    )
 
 
-    # ========================================================
-    # CHECK DETECTIONS
-    # ========================================================
+file_exists = os.path.exists(
+    OUTPUT_CSV
+)
 
-    # Harus diinisialisasi setiap frame.
-    # Jika tidak ada detection/track pada frame, list tetap kosong.
-    persons = []
-    ppe_detections = []
+csv_file = open(
+    OUTPUT_CSV,
+    mode="a",
+    newline="",
+    encoding="utf-8",
+)
 
-    if (
-        result.boxes is not None
-        and
-        result.boxes.id is not None
+csv_writer = csv.writer(
+    csv_file
+)
+
+
+if not file_exists:
+    header = [
+        "observation_id",
+        "timestamp",
+        "track_id",
+        "frames_observed",
+        *PPE_CLASSES,
+        "violation",
+    ]
+
+    csv_writer.writerow(header)
+    csv_file.flush()
+
+
+observation_id = 1
+
+if file_exists:
+    try:
+        with open(
+            OUTPUT_CSV,
+            mode="r",
+            encoding="utf-8",
+        ) as file:
+
+            rows = list(
+                csv.DictReader(file)
+            )
+
+            if rows:
+                observation_id = (
+                    int(
+                        rows[-1][
+                            "observation_id"
+                        ]
+                    )
+                    + 1
+                )
+
+    except (
+        OSError,
+        ValueError,
+        KeyError,
     ):
+        observation_id = 1
 
-        boxes = result.boxes
+
+telegram_thread = threading.Thread(
+    target=telegram_worker,
+    daemon=True,
+)
+
+telegram_thread.start()
 
 
-        # ----------------------------------------------------
-        # TRACK IDs
-        # ----------------------------------------------------
+frame_number = 0
 
-        track_ids = (
-            boxes.id
-            .int()
-            .cpu()
-            .tolist()
+last_telegram_send = (
+    time.monotonic()
+    - TELEGRAM_INTERVAL
+)
+
+
+print(
+    "YOLO PPE Monitoring started."
+)
+
+print(
+    f"Model: {MODEL_PATH}"
+)
+
+print(
+    f"Tracker: {TRACKER_CONFIG}"
+)
+
+print(
+    f"Image size: {IMAGE_SIZE}"
+)
+
+print(
+    f"Confidence: {CONFIDENCE}"
+)
+
+print(
+    "Telegram worker: ACTIVE"
+)
+
+print(
+    "Press Q to exit."
+)
+
+
+try:
+    while True:
+        ret, frame = cap.read()
+
+        if not ret:
+            print(
+                "Failed to read frame."
+            )
+            break
+
+        frame_number += 1
+
+        results = model.track(
+            source=frame,
+            imgsz=IMAGE_SIZE,
+            device=0,
+            conf=CONFIDENCE,
+            persist=True,
+            tracker=TRACKER_CONFIG,
+            verbose=False,
         )
 
-
-        # ----------------------------------------------------
-        # CLASS IDS
-        # ----------------------------------------------------
-
-        class_ids = (
-            boxes.cls
-            .int()
-            .cpu()
-            .tolist()
-        )
-
-
-        # ----------------------------------------------------
-        # CONFIDENCE
-        # ----------------------------------------------------
-
-        confidences = (
-            boxes.conf
-            .cpu()
-            .tolist()
-        )
-
-
-        # ----------------------------------------------------
-        # BOUNDING BOXES
-        # ----------------------------------------------------
-
-        xyxy = (
-            boxes.xyxy
-            .cpu()
-            .tolist()
-        )
-
-
-        # ====================================================
-        # SEPARATE PERSON AND PPE
-        # ====================================================
+        result = results[0]
 
         persons = []
-
         ppe_detections = []
 
-
-        for track_id, class_id, confidence, box in zip(
-
-            track_ids,
-            class_ids,
-            confidences,
-            xyxy
-
+        if (
+            result.boxes is not None
+            and result.boxes.id is not None
         ):
+            boxes = result.boxes
 
-            class_name = (
-                str(model.names[class_id])
-                .lower()
+            track_ids = (
+                boxes.id
+                .int()
+                .cpu()
+                .tolist()
             )
 
+            class_ids = (
+                boxes.cls
+                .int()
+                .cpu()
+                .tolist()
+            )
 
-            # ------------------------------------------------
-            # PERSON
-            # ------------------------------------------------
+            confidences = (
+                boxes.conf
+                .cpu()
+                .tolist()
+            )
 
-            if class_name == PERSON_CLASS:
+            xyxy = (
+                boxes.xyxy
+                .cpu()
+                .tolist()
+            )
 
-                persons.append({
+            for (
+                track_id,
+                class_id,
+                confidence,
+                box,
+            ) in zip(
+                track_ids,
+                class_ids,
+                confidences,
+                xyxy,
+            ):
+                class_name = str(
+                    model.names[class_id]
+                ).lower()
 
-                    "track_id": track_id,
+                if class_name == PERSON_CLASS:
+                    persons.append(
+                        {
+                            "track_id": track_id,
+                            "box": box,
+                            "confidence": confidence,
+                        }
+                    )
 
-                    "box": box,
+                elif class_name in PPE_CLASSES:
+                    ppe_detections.append(
+                        {
+                            "class": class_name,
+                            "box": box,
+                            "confidence": confidence,
+                        }
+                    )
 
-                    "confidence": confidence
+        current_track_ids = {
+            person["track_id"]
+            for person in persons
+        }
 
-                })
-
-
-            # ------------------------------------------------
-            # PPE
-            # ------------------------------------------------
-
-            elif class_name in PPE_CLASSES:
-
-                ppe_detections.append({
-
-                    "class": class_name,
-
-                    "box": box,
-
-                    "confidence": confidence
-
-                })
-
-
-        # ====================================================
-        # PROCESS EACH PERSON
-        # ====================================================
+        ppe_assignments = (
+            associate_ppe_to_persons(
+                persons,
+                ppe_detections,
+            )
+        )
 
         for person in persons:
-
             track_id = person["track_id"]
 
-            person_box = person["box"]
-
-
-            current_track_ids.add(
-                track_id
-            )
-
-
-            # =================================================
-            # CREATE TRACK RECORD
-            # =================================================
-
             if track_id not in tracks:
-
                 tracks[track_id] = {
-
-                    "first_seen":
+                    "first_seen": (
                         datetime.now().strftime(
                             "%Y-%m-%d %H:%M:%S"
-                        ),
-
-                    "last_seen_frame":
-                        frame_number,
-
-                    "frames":
-                        0,
-
+                        )
+                    ),
+                    "last_seen_frame": (
+                        frame_number
+                    ),
+                    "frames": 0,
                     "ppe_history": {
-
                         ppe: []
-
                         for ppe in PPE_CLASSES
-
-                    }
-
+                    },
                 }
 
-
-            track_data = tracks[track_id]
-
+            track_data = tracks[
+                track_id
+            ]
 
             track_data[
                 "last_seen_frame"
             ] = frame_number
 
-
-            track_data[
-                "frames"
-            ] += 1
-
-
-            # =================================================
-            # ASSOCIATE PPE
-            # =================================================
+            track_data["frames"] += 1
 
             detected_ppe = (
-                associate_ppe_to_person(
-                    person_box,
-                    ppe_detections
+                ppe_assignments.get(
+                    track_id,
+                    set(),
                 )
             )
 
-
-            # =================================================
-            # STORE PPE HISTORY
-            # =================================================
-
             for ppe in PPE_CLASSES:
-
-                if ppe in detected_ppe:
-
-                    value = 1
-
-                else:
-
-                    value = 0
-
+                value = int(
+                    ppe in detected_ppe
+                )
 
                 history = (
                     track_data[
@@ -950,359 +671,294 @@ while True:
                     ][ppe]
                 )
 
-
                 history.append(value)
 
-
-                # Jangan simpan history terlalu panjang
-                if len(history) > MAX_HISTORY:
-
+                if (
+                    len(history)
+                    > MAX_HISTORY
+                ):
                     history.pop(0)
 
+        tracks_to_remove = []
 
-    # ========================================================
-    # HANDLE LOST TRACKS
-    # ========================================================
+        for (
+            track_id,
+            track_data,
+        ) in list(tracks.items()):
 
-    tracks_to_remove = []
-
-
-    for track_id, track_data in tracks.items():
-
-        last_seen = (
-            track_data[
-                "last_seen_frame"
-            ]
-        )
-
-
-        missing_frames = (
-            frame_number - last_seen
-        )
-
-
-        # Jika track sudah lama hilang
-        if missing_frames > MAX_MISSING_FRAMES:
-
-            finalize_observation(
-                track_id,
-                track_data
+            missing_frames = (
+                frame_number
+                - track_data[
+                    "last_seen_frame"
+                ]
             )
 
-
-            tracks_to_remove.append(
-                track_id
-            )
-
-
-    # ========================================================
-    # DELETE FINISHED TRACKS
-    # ========================================================
-
-    for track_id in tracks_to_remove:
-
-        del tracks[track_id]
-
-
-    # ========================================================
-    # DISPLAY
-    # ========================================================
-
-    annotated_frame = result.plot()
-
-
-    # Informasi jumlah tracking
-    cv2.putText(
-
-        annotated_frame,
-
-        f"Tracked: {len(tracks)}",
-
-        (20, 40),
-
-        cv2.FONT_HERSHEY_SIMPLEX,
-
-        1,
-
-        (0, 255, 0),
-
-        2
-
-    )
-
-
-    cv2.putText(
-
-        annotated_frame,
-
-        f"Observations: {observation_id - 1}",
-
-        (20, 80),
-
-        cv2.FONT_HERSHEY_SIMPLEX,
-
-        0.8,
-
-        (255, 255, 255),
-
-        2
-
-    )
-
-
-    cv2.imshow(
-
-        "YOLO APD - Person Tracking",
-
-        annotated_frame
-
-    )
-
-
-    # ========================================================
-    # TELEGRAM - VIOLATION NOTIFICATION
-    # ========================================================
-    current_time = time.monotonic()
-
-    # `persons` berisi person yang benar-benar terdeteksi pada
-    # frame saat ini. Gunakan ini untuk mendapatkan bounding box
-    # karena track_data tidak menyimpan "box".
-    current_violation_tracks = set()
-    current_violation_details = {}
-
-    for person in persons:
-
-        track_id = person["track_id"]
-        person_box = person["box"]
-
-        detected_ppe = associate_ppe_to_person(
-            person_box,
-            ppe_detections
-        )
-
-        missing_ppe = [
-            ppe
-            for ppe in PPE_CLASSES
-            if ppe not in detected_ppe
-        ]
-
-        if missing_ppe:
-
-            current_violation_tracks.add(
-                track_id
-            )
-
-            current_violation_details[
-                track_id
-            ] = missing_ppe
-
-            # Mulai timer ketika violation pertama
-            # kali terlihat pada track person ini.
-            if track_id not in violation_start_times:
-
-                violation_start_times[
-                    track_id
-                ] = current_time
-
-                print(
-                    f"[VIOLATION] Person ID {track_id} "
-                    f"mulai violation."
+            if (
+                missing_frames
+                > MAX_MISSING_FRAMES
+            ):
+                observation_id = (
+                    finalize_observation(
+                        track_id,
+                        track_data,
+                        csv_writer,
+                        csv_file,
+                        observation_id,
+                    )
                 )
 
-            active_violation_ppe[
-                track_id
-            ] = missing_ppe
+                tracks_to_remove.append(
+                    track_id
+                )
 
-    # ========================================================
-    # RESET VIOLATION YANG SUDAH BERHENTI
-    # ========================================================
-    ended_tracks = (
-        set(violation_start_times.keys())
-        - current_violation_tracks
-    )
-
-    for track_id in ended_tracks:
-
-        duration = (
-            current_time
-            - violation_start_times[
-                track_id
-            ]
-        )
-
-        if duration < VIOLATION_MIN_DURATION:
-
-            print(
-                f"[VIOLATION] Person ID {track_id}: "
-                f"{duration:.1f}s < "
-                f"{VIOLATION_MIN_DURATION:.1f}s "
-                f"-> tidak dikirim."
+        for track_id in tracks_to_remove:
+            tracks.pop(
+                track_id,
+                None,
             )
 
-        violation_start_times.pop(
-            track_id,
-            None
-        )
+            violation_start_times.pop(
+                track_id,
+                None,
+            )
 
-        active_violation_ppe.pop(
-            track_id,
-            None
-        )
+            active_violation_ppe.pop(
+                track_id,
+                None,
+            )
 
-        # Jika violation sudah selesai,
-        # track ID tersebut boleh dilaporkan lagi
-        # pada violation berikutnya.
-        reported_violation_ids.discard(
-            track_id
-        )
-
-    # ========================================================
-    # CEK VIOLATION MINIMAL 3 DETIK
-    # ========================================================
-    valid_violations = []
-
-    for track_id in current_violation_tracks:
-
-        start_time = (
-            violation_start_times.get(
+            reported_violation_ids.discard(
                 track_id
             )
-        )
 
-        if start_time is None:
-            continue
+        current_time = time.monotonic()
 
-        duration = (
-            current_time
-            - start_time
-        )
+        current_violation_tracks = set()
+        current_violation_details = {}
 
-        if duration >= VIOLATION_MIN_DURATION:
+        for person in persons:
+            track_id = person["track_id"]
 
-            valid_violations.append(
-                (
+            detected_ppe = (
+                ppe_assignments.get(
                     track_id,
+                    set(),
+                )
+            )
+
+            missing_ppe = [
+                ppe
+                for ppe in PPE_CLASSES
+                if ppe not in detected_ppe
+            ]
+
+            if missing_ppe:
+                current_violation_tracks.add(
+                    track_id
+                )
+
+                current_violation_details[
+                    track_id
+                ] = missing_ppe
+
+                if (
+                    track_id
+                    not in violation_start_times
+                ):
+                    violation_start_times[
+                        track_id
+                    ] = current_time
+
+                active_violation_ppe[
+                    track_id
+                ] = missing_ppe
+
+        ended_tracks = (
+            set(
+                violation_start_times.keys()
+            )
+            - current_violation_tracks
+        )
+
+        for track_id in ended_tracks:
+            violation_start_times.pop(
+                track_id,
+                None,
+            )
+
+            active_violation_ppe.pop(
+                track_id,
+                None,
+            )
+
+            reported_violation_ids.discard(
+                track_id
+            )
+
+        valid_violations = []
+
+        for track_id in current_violation_tracks:
+            start_time = (
+                violation_start_times.get(
+                    track_id
+                )
+            )
+
+            if start_time is None:
+                continue
+
+            duration = (
+                current_time
+                - start_time
+            )
+
+            if (
+                duration
+                >= VIOLATION_MIN_DURATION
+            ):
+                missing_ppe = (
                     active_violation_ppe.get(
                         track_id,
-                        current_violation_details[
-                            track_id
-                        ]
-                    ),
-                    duration
+                        current_violation_details.get(
+                            track_id,
+                            [],
+                        ),
+                    )
                 )
-            )
 
-    # ========================================================
-    # KIRIM TELEGRAM
-    # ========================================================
-    # Syarat:
-    # - violation bertahan minimal 3 detik
-    # - track ID belum dilaporkan
-    # - minimal 20 detik sejak notifikasi terakhir
-    if (
-        valid_violations
-        and
-        current_time
-        - last_telegram_send
-        >= TELEGRAM_INTERVAL
-    ):
+                valid_violations.append(
+                    (
+                        track_id,
+                        missing_ppe,
+                        duration,
+                    )
+                )
 
-        track_id, missing_ppe, duration = (
-            valid_violations[0]
+        annotated_frame = result.plot()
+
+        cv2.putText(
+            annotated_frame,
+            f"Tracked: {len(current_track_ids)}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2,
+        )
+
+        cv2.putText(
+            annotated_frame,
+            (
+                f"Observations: "
+                f"{observation_id - 1}"
+            ),
+            (20, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
         )
 
         if (
-            track_id
-            not in reported_violation_ids
+            valid_violations
+            and (
+                current_time
+                - last_telegram_send
+                >= TELEGRAM_INTERVAL
+            )
         ):
-
-            print()
-            print("========================================")
-            print(
-                "[TELEGRAM] VALID VIOLATION"
-            )
-            print(
-                f"[TELEGRAM] Person ID : "
-                f"{track_id}"
-            )
-            print(
-                f"[TELEGRAM] Durasi    : "
-                f"{duration:.1f} detik"
-            )
-            print(
-                f"[TELEGRAM] APD       : "
-                f"{', '.join(missing_ppe)}"
-            )
-            print("========================================")
-
-            sent = send_violation_to_telegram(
-                frame.copy(),
-                annotated_frame.copy(),
+            (
                 track_id,
-                missing_ppe
-            )
+                missing_ppe,
+                duration,
+            ) = valid_violations[0]
 
-            if sent:
+            if (
+                track_id
+                not in reported_violation_ids
+            ):
+                try:
+                    telegram_queue.put_nowait(
+                        (
+                            frame.copy(),
+                            annotated_frame.copy(),
+                            track_id,
+                            missing_ppe,
+                        )
+                    )
 
-                last_telegram_send = (
-                    current_time
-                )
+                    last_telegram_send = (
+                        current_time
+                    )
 
-                reported_violation_ids.add(
-                    track_id
-                )
+                    reported_violation_ids.add(
+                        track_id
+                    )
 
-                print(
-                    f"[TELEGRAM] Person ID "
-                    f"{track_id} berhasil "
-                    f"dilaporkan."
-                )
+                    print(
+                        f"[VIOLATION] Queued "
+                        f"Track={track_id} "
+                        f"Duration={duration:.1f}s "
+                        f"Missing={missing_ppe}"
+                    )
 
-    # ========================================================
-    # QUIT
-    # ========================================================
+                except queue.Full:
+                    print(
+                        "[TELEGRAM] Queue full. "
+                        "Notification skipped."
+                    )
 
-    key = cv2.waitKey(1) & 0xFF
+        cv2.imshow(
+            "YOLO PPE Monitoring",
+            annotated_frame,
+        )
 
+        key = (
+            cv2.waitKey(1)
+            & 0xFF
+        )
 
-    if key == ord("q"):
+        if key == ord("q"):
+            break
 
-        break
-
-
-# ============================================================
-# FINALIZE REMAINING TRACKS
-# ============================================================
-
-print()
-print("Finalizing remaining observations...")
-
-
-for track_id, track_data in tracks.items():
-
-    finalize_observation(
-        track_id,
-        track_data
+except KeyboardInterrupt:
+    print(
+        "\nProgram stopped."
     )
 
+finally:
+    for (
+        track_id,
+        track_data,
+    ) in list(tracks.items()):
 
-# ============================================================
-# CLEANUP
-# ============================================================
+        observation_id = (
+            finalize_observation(
+                track_id,
+                track_data,
+                csv_writer,
+                csv_file,
+                observation_id,
+            )
+        )
 
-cap.release()
+    print(
+        "Waiting for Telegram queue..."
+    )
 
-csv_file.close()
+    telegram_queue.join()
 
-cv2.destroyAllWindows()
+    telegram_queue.put(None)
 
+    telegram_thread.join(
+        timeout=5
+    )
 
-print()
-print("========================================")
-print("PROGRAM SELESAI")
-print("========================================")
+    cap.release()
+    csv_file.close()
+    cv2.destroyAllWindows()
 
-print(
-    f"Data observasi tersimpan di:"
-    f" {OUTPUT_CSV}"
-)
+    print(
+        f"Observations saved to: "
+        f"{OUTPUT_CSV}"
+    )x``
