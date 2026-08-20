@@ -9,7 +9,7 @@ __pycache__/
 runs/
 
 # Model weights
-*.onnx
+# *.onnx
 
 # Dataset
 datasets/
