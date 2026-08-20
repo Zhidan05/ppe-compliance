@@ -15,12 +15,21 @@ runs/
 datasets/
 *.zip
 
+# Python cache
+__pycache__/
+*.py[cod]
+
 # Cache
 *.cache
 
 # IDE
 .vscode/
 .idea/
+
+# Virtual Environment
+env/
+venv/
+.venv/
 
 # OS
 .env

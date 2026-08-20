@@ -16,7 +16,7 @@ from ultralytics import YOLO
 load_dotenv()
 
 
-MODEL_PATH = r"runs\detect\train-6\weights\best.pt"
+MODEL_PATH = r"runs\detect\train-6\weights\best.onnx"
 OUTPUT_CSV = "observations.csv"
 
 CAMERA_INDEX = 0
