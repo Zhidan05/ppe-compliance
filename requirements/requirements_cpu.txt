@@ -1,0 +1,26 @@
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+# PyTorch CPU Runtime
+torch
+torchvision
+
+# YOLO Engine & Utilities
+ultralytics==8.4.117
+ultralytics-thop==2.1.6
+
+# CPU Acceleration Engines
+openvino
+onnx==1.20.1
+onnxruntime>=1.20.0
+onnxslim>=0.1.96
+
+# Computer Vision & Math
+opencv-python==5.0.0.93
+numpy==2.4.4
+
+# System, Networking & Config
+python-dotenv
+requests==2.34.2
+psutil==7.2.2
+PyYAML==6.0.3

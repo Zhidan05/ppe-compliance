@@ -1,39 +1,75 @@
-# Virtual Environment
-yolo-env/
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+replace.txt
 
-# Python
-__pycache__/
-*.py[cod]
 
-# YOLO training output
-runs/
-
-# Model weights
-# *.onnx
-
-# Dataset
-datasets/
-*.zip
-
-# Python cache
-__pycache__/
-*.py[cod]
-
-# Cache
-*.cache
-
-# IDE
-.vscode/
-.idea/
-
-# Virtual Environment
+# ==========================================
+# Virtual Environments
+# ==========================================
 env/
 venv/
 .venv/
+yolo-env/
 
-# OS
-.env
-replace.txt
+
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+# ==========================================
+# Python Cache / Tool Cache
+# ==========================================
+*.cache
+
+
+# ==========================================
+# YOLO Training Output
+# ==========================================
+runs/
+
+
+# ==========================================
+# Datasets
+# ==========================================
+datasets/
+*.zip
+
+
+# ==========================================
+# Model Exports
+# ==========================================
+*.onnx
+*.engine
+*.bin
+
+# Optional: uncomment if trained model weights
+# should NOT be uploaded to GitHub
+# models/**/*.pt
+
+
+# ==========================================
+# IDE
+# ==========================================
+.vscode/
+.idea/
+
+
+# ==========================================
+# OS Files
+# ==========================================
 Thumbs.db
-.DS_Store.env
-replace.txt
+.DS_Store
+
+
+# ==========================================
+# Logs
+# ==========================================
+*.log
