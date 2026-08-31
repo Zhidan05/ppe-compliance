@@ -29,8 +29,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 OUTPUT_CSV = DATA_DIR / "observations.csv"
 # CAMERA_INDEX = 0
-CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "")
-
+CAMERA_SOURCE = os.getenv("CAMERA_SOURCE")
 TRACKER_CONFIG = "botsort.yaml"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -354,11 +353,36 @@ if missing_classes:
     raise ValueError(f"PPE class tidak ditemukan: {missing_classes}")
 
 # Inisialisasi Kamera
+# cap = cv2.VideoCapture(CAMERA_SOURCE, cv2.CAP_FFMPEG)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000"
 cap = cv2.VideoCapture(CAMERA_SOURCE, cv2.CAP_FFMPEG)
 if not cap.isOpened():
     raise RuntimeError(
         "Kamera gagal dibuka. Periksa RTSP URL, username, password, dan IP kamera."
     )
+
+# ==========================================
+# WINDOW PREVIEW
+# ==========================================
+# WINDOW_NORMAL + WINDOW_KEEPRATIO hanya mengubah ukuran tampilan.
+# Frame asli RTSP tidak di-crop atau di-resize.
+WINDOW_NAME = "PPE Compliance Monitoring"
+cv2.namedWindow(
+    WINDOW_NAME,
+    cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO
+)
+
+# Ambil resolusi asli stream RTSP.
+stream_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+stream_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+print(f"RTSP Stream Resolution: {stream_width}x{stream_height}")
+
+# Ukuran preview hanya untuk display. Seluruh field of view tetap terlihat.
+if stream_width > 0 and stream_height > 0:
+    preview_width = min(stream_width, 1280)
+    preview_height = int(stream_height * (preview_width / stream_width))
+    cv2.resizeWindow(WINDOW_NAME, preview_width, preview_height)
 
 # Inisialisasi File CSV
 file_exists = OUTPUT_CSV.exists()
@@ -527,7 +551,11 @@ try:
                 except queue.Full:
                     print("[TELEGRAM] Antrean penuh, notifikasi dilewati.")
 
-        cv2.imshow("PPE Compliance Monitoring", annotated_frame)
+        # Tampilkan seluruh frame RTSP tanpa crop.
+        # YOLO melakukan internal letterbox untuk inferensi, tetapi result.plot()
+        # dikembalikan ke koordinat/resolusi frame asli.
+        cv2.imshow(WINDOW_NAME, annotated_frame)
+
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
