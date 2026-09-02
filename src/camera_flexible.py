@@ -1,3 +1,7 @@
+# Modul: camera_flexible.py
+# Deskripsi: Skrip utama deteksi kelengkapan APD (topi & vest) real-time berbasis RTSP dan YOLO.
+# Model inferensi dipilih secara otomatis berdasarkan profil hardware (CPU/GPU/Edge).
+
 import csv
 import json
 import os
@@ -18,6 +22,7 @@ from ultralytics import YOLO
 
 # ==========================================
 # PATH PROYEK & KONFIGURASI GLOBAL
+# Mengatur path direktori proyek dan memuat variabel lingkungan (.env).
 # ==========================================
 # Lokasi: ppe-compliance/src/camera_flexible.py
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -28,8 +33,10 @@ DATA_DIR = PROJECT_ROOT / "data"
 load_dotenv(PROJECT_ROOT / ".env")
 
 OUTPUT_CSV = DATA_DIR / "observations.csv"
-# CAMERA_INDEX = 0
-CAMERA_SOURCE = os.getenv("CAMERA_SOURCE")
+# RSTP Stream
+# CAMERA_SOURCE = os.getenv("CAMERA_SOURCE")
+# Webcam Stream
+CAMERA_SOURCE = 0
 TRACKER_CONFIG = "botsort.yaml"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,6 +57,7 @@ JPEG_QUALITY = 85
 TELEGRAM_QUEUE_SIZE = 10
 
 # State Tracker & Notifikasi
+# Variabel global untuk pelacakan status individu dan antrean pengiriman notifikasi Telegram.
 reported_violation_ids = set()
 violation_start_times = {}
 active_violation_ppe = {}
@@ -59,9 +67,10 @@ telegram_queue = queue.Queue(maxsize=TELEGRAM_QUEUE_SIZE)
 
 # ==========================================
 # HARDWARE PROFILING & SELEKSI MODEL
+# Mendeteksi spesifikasi hardware (GPU/CPU/Edge) untuk memilih model inferensi paling optimal.
 # ==========================================
 def find_openvino_model(base_dir: Path) -> Path | None:
-    """Mencari file model OpenVINO (.xml) yang valid."""
+    # Mencari file model OpenVINO (.xml) yang valid.
     ov_dir = base_dir / "openvino"
     if not ov_dir.exists():
         return None
@@ -70,7 +79,7 @@ def find_openvino_model(base_dir: Path) -> Path | None:
 
 
 def detect_hardware_profile(base_dir: Path):
-    """Mendeteksi spesifikasi sistem dan memilih format model paling optimal."""
+    # Mendeteksi spesifikasi sistem dan memilih format model paling optimal.
     has_cuda = torch.cuda.is_available()
     cpu_info = platform.processor().lower()
     total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
@@ -82,7 +91,7 @@ def detect_hardware_profile(base_dir: Path):
     tflite_path = base_dir / "tflite" / "best.tflite"
     ov_xml = find_openvino_model(base_dir)
 
-    # 1. High Tier: GPU NVIDIA (TensorRT -> ONNX CUDA -> PyTorch CUDA)
+    # 1. High Tier: GPU NVIDIA (Prioritas: TensorRT > ONNX CUDA > PyTorch).
     if has_cuda:
         if engine_path.exists():
             return {
@@ -109,7 +118,7 @@ def detect_hardware_profile(base_dir: Path):
                 "device": 0,
             }
 
-    # 2. Mid Tier: CPU x86 / OpenVINO Optimized
+    # 2. Mid Tier: CPU x86 (Prioritas: OpenVINO).
     if ov_xml and ("intel" in cpu_info or "amd" in cpu_info or "ryzen" in cpu_info):
         return {
             "tier": "x86 CPU (OpenVINO)",
@@ -119,7 +128,7 @@ def detect_hardware_profile(base_dir: Path):
             "device": "cpu",
         }
 
-    # 3. Low Tier: ARM / Raspberry Pi / Low RAM
+    # 3. Low Tier: Edge/ARM/RAM Minim (Prioritas: TFLite > ONNX > PyTorch).
     if is_arm or total_ram_gb < 4.0:
         chosen = tflite_path if tflite_path.exists() else (onnx_path if onnx_path.exists() else pt_path)
         return {
@@ -130,7 +139,7 @@ def detect_hardware_profile(base_dir: Path):
             "device": "cpu",
         }
 
-    # 4. Standard Fallback: CPU ONNX / PyTorch
+    # 4. Standard Fallback: CPU fallback (ONNX > PyTorch).
     chosen = onnx_path if onnx_path.exists() else pt_path
     return {
         "tier": "Standard CPU (ONNX/PyTorch)",
@@ -142,7 +151,7 @@ def detect_hardware_profile(base_dir: Path):
 
 
 def prepare_onnx_cuda(model_path: Path):
-    """Preload DLL CUDA sebelum runtime ONNX dimulai."""
+    # Preload DLL CUDA sebelum runtime ONNX dimulai.
     if torch.cuda.is_available() and str(model_path).lower().endswith(".onnx"):
         try:
             import onnxruntime as ort
@@ -153,24 +162,29 @@ def prepare_onnx_cuda(model_path: Path):
 
 # ==========================================
 # GEOMETRI & DETEKSI APD
+# Utilitas spasial untuk memetakan objek deteksi APD (topi, rompi) kepada individu.
 # ==========================================
 def center_of_box(box):
+    # Menghitung titik tengah (center) dari sebuah bounding box (x1, y1, x2, y2).
     x1, y1, x2, y2 = box
     return ((x1 + x2) / 2, (y1 + y2) / 2)
 
 
 def point_inside_box(point, box):
+    # Mengecek apakah sebuah titik koordinat (x, y) berada di dalam bounding box tertentu.
     px, py = point
     x1, y1, x2, y2 = box
     return x1 <= px <= x2 and y1 <= py <= y2
 
 
 def box_area(box):
+    # Menghitung luas area dari sebuah bounding box.
     x1, y1, x2, y2 = box
     return max(0, x2 - x1) * max(0, y2 - y1)
 
 
 def associate_ppe_to_persons(persons, ppe_detections):
+    # Mengasosiasikan objek APD ke individu terdekat berdasarkan titik tengah bounding box.
     assignments = {person["track_id"]: set() for person in persons}
 
     for ppe in ppe_detections:
@@ -187,6 +201,7 @@ def associate_ppe_to_persons(persons, ppe_detections):
 
 
 def majority_vote(values):
+    # Mendapatkan nilai dengan kemunculan paling sering (modus) dari sebuah list.
     if not values:
         return 0
     return Counter(values).most_common(1)[0][0]
@@ -194,8 +209,10 @@ def majority_vote(values):
 
 # ==========================================
 # NOTIFIKASI TELEGRAM (SESSION REUSED)
+# Pengiriman notifikasi gambar secara asinkron menggunakan koneksi HTTP persisten.
 # ==========================================
 def send_violation_to_telegram(session, raw_frame, annotated_frame, track_id, missing_ppe):
+    # Mengirim foto asli dan hasil deteksi (MediaGroup) ke API Telegram.
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
     raw_success, raw_buffer = cv2.imencode(".jpg", raw_frame, encode_params)
     ann_success, ann_buffer = cv2.imencode(".jpg", annotated_frame, encode_params)
@@ -245,7 +262,8 @@ def send_violation_to_telegram(session, raw_frame, annotated_frame, track_id, mi
 
 
 def telegram_worker():
-    # Menggunakan session HTTP tunggal untuk reuse TCP / TLS Handshake
+    # Worker background untuk memproses antrean pesan tanpa memblokir thread deteksi utama.
+    # Menggunakan HTTP Session persisten untuk optimasi koneksi.
     with requests.Session() as session:
         while True:
             item = telegram_queue.get()
@@ -264,8 +282,10 @@ def telegram_worker():
 
 # ==========================================
 # LOGGING CSV OBSERVATION
+# Merekam data final kelengkapan APD setiap individu ke dalam file log CSV.
 # ==========================================
 def finalize_observation(track_id, track_data, csv_writer, csv_file, obs_id):
+    # Mengevaluasi riwayat status individu (majority vote) dan menyimpannya ke CSV.
     frames = track_data["frames"]
     if frames < MIN_FRAMES:
         return obs_id
@@ -287,8 +307,10 @@ def finalize_observation(track_id, track_data, csv_writer, csv_file, obs_id):
 
 # ==========================================
 # VISUAL HUD / DASHBOARD
+# Menggambar elemen antarmuka (HUD) metrik performa dan status deteksi pada frame.
 # ==========================================
 def draw_info_panel(frame, hw_cfg, tracked_count, violation_count, observations, fps):
+    # Me-render panel informasi statistik real-time pada sudut frame.
     panel_x, panel_y = 16, 16
     panel_w = min(390, frame.shape[1] - 32)
     panel_h = 156
@@ -325,6 +347,7 @@ def draw_info_panel(frame, hw_cfg, tracked_count, violation_count, observations,
 
 # ==========================================
 # INISIALISASI & VALIDASI
+# Persiapan environment, pemuatan model YOLO, dan koneksi aliran RTSP kamera.
 # ==========================================
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum diset di .env")
@@ -352,20 +375,23 @@ missing_classes = [ppe for ppe in PPE_CLASSES if ppe not in model_class_names]
 if missing_classes:
     raise ValueError(f"PPE class tidak ditemukan: {missing_classes}")
 
-# Inisialisasi Kamera
-# cap = cv2.VideoCapture(CAMERA_SOURCE, cv2.CAP_FFMPEG)
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000"
-cap = cv2.VideoCapture(CAMERA_SOURCE, cv2.CAP_FFMPEG)
+# Inisialisasi koneksi kamera (Otomatis mendeteksi RTSP atau Webcam lokal)
+if isinstance(CAMERA_SOURCE, str) and CAMERA_SOURCE.startswith("rtsp"):
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000"
+    cap = cv2.VideoCapture(CAMERA_SOURCE, cv2.CAP_FFMPEG)
+else:
+    source_id = int(CAMERA_SOURCE) if str(CAMERA_SOURCE).isdigit() else CAMERA_SOURCE
+    cap = cv2.VideoCapture(source_id)
+
 if not cap.isOpened():
     raise RuntimeError(
-        "Kamera gagal dibuka. Periksa RTSP URL, username, password, dan IP kamera."
+        f"Kamera gagal dibuka dengan source: {CAMERA_SOURCE}. Periksa RTSP URL atau index Webcam."
     )
 
 # ==========================================
 # WINDOW PREVIEW
+# Inisialisasi GUI pemantauan dengan skala dinamis. Frame internal diproses menggunakan resolusi asli.
 # ==========================================
-# WINDOW_NORMAL + WINDOW_KEEPRATIO hanya mengubah ukuran tampilan.
-# Frame asli RTSP tidak di-crop atau di-resize.
 WINDOW_NAME = "PPE Compliance Monitoring"
 cv2.namedWindow(
     WINDOW_NAME,
@@ -384,7 +410,7 @@ if stream_width > 0 and stream_height > 0:
     preview_height = int(stream_height * (preview_width / stream_width))
     cv2.resizeWindow(WINDOW_NAME, preview_width, preview_height)
 
-# Inisialisasi File CSV
+# Setup log CSV dengan format append. Inisialisasi observation_id dilakukan dari log eksisting.
 file_exists = OUTPUT_CSV.exists()
 csv_file = open(OUTPUT_CSV, mode="a", newline="", encoding="utf-8")
 csv_writer = csv.writer(csv_file)
@@ -403,7 +429,7 @@ if file_exists:
     except (OSError, ValueError, KeyError):
         observation_id = 1
 
-# Start Background Thread
+# Eksekusi thread Telegram secara daemon agar tidak memblokir penutupan skrip.
 telegram_thread = threading.Thread(target=telegram_worker, daemon=True)
 telegram_thread.start()
 
@@ -417,6 +443,7 @@ print("Monitoring APD CCTV Berjalan. Tekan 'Q' untuk berhenti.")
 
 # ==========================================
 # MAIN LOOP MONITORING
+# Loop pembacaan frame, inferensi model (tracking), evaluasi aturan K3 (APD), dan pengiriman notifikasi.
 # ==========================================
 try:
     while True:
@@ -429,7 +456,7 @@ try:
 
         frame_number += 1
 
-        # Inferensi YOLO Tracking (tanpa parameter 'half' deprecated)
+        # Inferensi YOLO dan tracking multi-objek (BoT-SORT).
         results = model.track(
             source=frame,
             imgsz=hw_cfg["imgsz"],
@@ -461,7 +488,7 @@ try:
         current_track_ids = {p["track_id"] for p in persons}
         ppe_assignments = associate_ppe_to_persons(persons, ppe_detections)
 
-        # Update riwayat track personil
+        # Perekaman riwayat kelengkapan atribut (topi, vest) untuk setiap individu.
         for person in persons:
             track_id = person["track_id"]
             if track_id not in tracks:
@@ -483,7 +510,7 @@ try:
                 if len(hist) > MAX_HISTORY:
                     hist.pop(0)
 
-        # Hapus data person yang meninggalkan frame (Memory Guard)
+        # Rilis tracking individu yang telah hilang dari pantauan (Out-of-Frame).
         tracks_to_remove = [t_id for t_id, d in tracks.items() if (frame_number - d["last_seen_frame"]) > MAX_MISSING_FRAMES]
         for t_id in tracks_to_remove:
             observation_id = finalize_observation(t_id, tracks[t_id], csv_writer, csv_file, observation_id)
@@ -492,7 +519,7 @@ try:
             active_violation_ppe.pop(t_id, None)
             reported_violation_ids.discard(t_id)
 
-        # Evaluasi Pelanggaran APD
+        # Evaluasi pemenuhan standar APD harian pada frame aktif.
         current_time = time.monotonic()
         current_violation_tracks = set()
         current_violation_details = {}
@@ -509,13 +536,13 @@ try:
                     violation_start_times[t_id] = current_time
                 active_violation_ppe[t_id] = missing_ppe
 
-        # Reset timer jika person sudah patuh
+        # Reset durasi teguran jika individu telah mengenakan kelengkapan.
         for t_id in (set(violation_start_times.keys()) - current_violation_tracks):
             violation_start_times.pop(t_id, None)
             active_violation_ppe.pop(t_id, None)
             reported_violation_ids.discard(t_id)
 
-        # Filter validasi durasi (Minimal 3 detik)
+        # Filter Time-to-Trigger (False Positive handling).
         valid_violations = []
         for t_id in current_violation_tracks:
             start_time = violation_start_times.get(t_id)
@@ -523,7 +550,7 @@ try:
                 missing = active_violation_ppe.get(t_id, current_violation_details.get(t_id, []))
                 valid_violations.append((t_id, missing, current_time - start_time))
 
-        # Visualisasi & Rendering HUD
+        # Render visualisasi bounding box dan label klasifikasi.
         annotated_frame = result.plot()
 
         frame_elapsed = max(time.perf_counter() - frame_start_time, 1e-6)
@@ -539,7 +566,7 @@ try:
             fps=fps_display,
         )
 
-        # Antrean Telegram Non-Blocking
+        # Pendaftaran notifikasi Telegram ke dalam queue worker berdasarkan throttle-interval.
         if valid_violations and (current_time - last_telegram_send >= TELEGRAM_INTERVAL):
             v_track_id, v_missing, v_dur = valid_violations[0]
             if v_track_id not in reported_violation_ids:
@@ -551,9 +578,7 @@ try:
                 except queue.Full:
                     print("[TELEGRAM] Antrean penuh, notifikasi dilewati.")
 
-        # Tampilkan seluruh frame RTSP tanpa crop.
-        # YOLO melakukan internal letterbox untuk inferensi, tetapi result.plot()
-        # dikembalikan ke koordinat/resolusi frame asli.
+        # Rendering GUI Display Frame.
         cv2.imshow(WINDOW_NAME, annotated_frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):

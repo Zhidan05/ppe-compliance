@@ -2,25 +2,26 @@
 --extra-index-url https://pypi.org/simple
 
 # PyTorch CPU Runtime
-torch
-torchvision
+torch==2.11.0
+torchvision==0.26.0
 
 # YOLO Engine & Utilities
 ultralytics==8.4.117
 ultralytics-thop==2.1.6
 
 # CPU Acceleration Engines
-openvino
-onnx==1.20.1
-onnxruntime>=1.20.0
-onnxslim>=0.1.96
+openvino==2026.3.0
+onnx==1.21.0
+onnxruntime==1.26.0
+onnxslim==0.1.96
 
 # Computer Vision & Math
 opencv-python==5.0.0.93
 numpy==2.4.4
 
 # System, Networking & Config
-python-dotenv
+python-dotenv==1.2.3
 requests==2.34.2
 psutil==7.2.2
 PyYAML==6.0.3
+pytapo==3.4.18

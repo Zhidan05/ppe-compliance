@@ -13,8 +13,8 @@ matplotlib==3.11.1
 PyYAML==6.0.3
 pillow==12.2.0
 requests==2.34.2
-tqdm
+tqdm==4.70.0
 psutil==7.2.2
 
-onnx==1.20.1
-onnxruntime-gpu==1.29.0
+onnx==1.21.0
+onnxruntime-gpu==1.26.0
